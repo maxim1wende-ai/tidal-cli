@@ -80,7 +80,7 @@ async function handleRefreshToken(params: Record<string, any>) {
       const refreshed = await refreshTidalToken(tidalTokens.refreshToken);
       await saveTidalTokens(userId, {
         accessToken: refreshed.access_token,
-        refreshToken: refreshed.refresh_token,
+        refreshToken: refreshed.refresh_token ?? tidalTokens.refreshToken,
         expiresAt: Date.now() + refreshed.expires_in * 1000,
         countryCode: tidalTokens.countryCode,
         userId: tidalTokens.userId,
