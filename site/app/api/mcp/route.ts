@@ -3,12 +3,17 @@ import { createMcpHandler, withMcpAuth } from 'mcp-handler';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { z } from 'zod';
 import { registerTools } from '../../mcp-lib/tools';
+import { registerMaximTools } from '../../mcp-lib/maxim-tools';
 import { getAccessTokenUserId } from '../../mcp-lib/redis';
 import { SITE_URL } from '../../mcp-lib/constants';
+
+// Vercel: Funktionen dieser Route dürfen bis zu 60 Sekunden laufen
+export const maxDuration = 60;
 
 const mcpHandler = createMcpHandler(
   (server: McpServer) => {
     registerTools(server);
+    registerMaximTools(server);
 
     server.prompt('search_artist', 'Search for an artist and show their top tracks', { artist: z.string().describe('Artist name') },
       ({ artist }) => ({
