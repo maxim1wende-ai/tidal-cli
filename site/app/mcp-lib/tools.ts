@@ -32,7 +32,7 @@ async function getClientAndCountry(bearerToken: string): Promise<{ client: any; 
     const refreshed = await refreshTidalToken(tokens.refreshToken);
     tokens = {
       accessToken: refreshed.access_token,
-      refreshToken: refreshed.refresh_token,
+      refreshToken: refreshed.refresh_token ?? tokens.refreshToken,
       expiresAt: Date.now() + refreshed.expires_in * 1000,
       countryCode: tokens.countryCode,
       userId: tokens.userId,
