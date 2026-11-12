@@ -30,7 +30,7 @@ const DAY_MS = 86400000;
 const HISTORY_DAYS = 365;
 const HISTORY_TTL_S = 400 * 86400;
 const TRACK_TTL_S = 60 * 86400;
-const TRACK_MISSING_TTL_S = 14 * 86400;
+const TRACK_MISSING_TTL_S = 60 * 86400;
 const LIST_TTL_S = 45 * 86400;
 const FAVORITES_REFRESH_DAYS = 7;
 const CALL_BUDGET_MS = 54000; // Vercel-Funktion läuft max. 60 s (siehe route.ts)
@@ -250,7 +250,7 @@ async function apiCall(ctx: Ctx, method: 'GET' | 'POST', path: string, params: R
       status = Number(res?.response?.status ?? 0);
       lastStatus = status;
       if (!res?.error && status !== 429 && (method === 'POST' || res?.data)) {
-        spacing = Math.max(SPACING_MIN_MS, Math.floor(spacing * 0.97));
+        spacing = Math.max(SPACING_MIN_MS, spacing - 15);
         return res?.data ?? null;
       }
       lastError = res?.error ?? `HTTP ${status}`;
@@ -260,7 +260,7 @@ async function apiCall(ctx: Ctx, method: 'GET' | 'POST', path: string, params: R
     }
     if (status === 429) {
       ctx.rateLimited++;
-      spacing = Math.min(SPACING_MAX_MS, spacing * 2);
+      spacing = Math.min(SPACING_MAX_MS, Math.round(spacing * 1.5) + 50);
       pauseUntil = Math.max(pauseUntil, Date.now() + retryAfterMs(res, attempt));
       lastError = 'HTTP 429 (Rate-Limit)';
       continue;
@@ -391,6 +391,9 @@ async function fetchTrackBatch(ctx: Ctx, ids: string[]): Promise<Map<string, Tra
   return out;
 }
 
+// wird true, sobald eine Sammelabfrage mehrere Tracks geliefert hat (Tidal beachtet also mehrere IDs)
+let multiIdOk = false;
+
 async function getTrackDetails(ctx: Ctx, ids: string[], until: number): Promise<Details> {
   const unique = dedupe(ids);
   const map = new Map<string, TrackMeta>();
@@ -412,45 +415,71 @@ async function getTrackDetails(ctx: Ctx, ids: string[], until: number): Promise<
       complete = false;
       return;
     }
-    let fetched = new Map<string, TrackMeta>();
+    const fetched = new Map<string, TrackMeta>();
     const confirmedMissing = new Set<string>();
-    let batchError: unknown = null;
     const noteError = (err: unknown) => {
       errors++;
       ctx.lookups.errors++;
       if (ctx.lookups.samples.length < 3) ctx.lookups.samples.push(errMsg(err).slice(0, 160));
     };
-    ctx.lookups.batches++;
-    try {
-      fetched = await fetchTrackBatch(ctx, batch);
-    } catch (err) {
-      batchError = err;
-    }
-    if (batch.length === 1) {
-      if (batchError === null) {
-        if (!fetched.has(batch[0])) confirmedMissing.add(batch[0]);
-      } else if (isPermanent(batchError)) confirmedMissing.add(batch[0]);
-      else noteError(batchError);
-    } else {
-      // Was die Sammelabfrage nicht geliefert hat, einzeln nachfragen
-      // (nicht verfügbar im Land – oder die API beachtet nur eine ID pro Anfrage)
-      const rest = batch.filter((id) => !fetched.has(id));
-      await mapLimit(rest, 3, async (id) => {
-        if (Date.now() > until) {
-          complete = false;
+    // eine Gruppe abfragen; bei "ungültige ID" (400 o. ä.) halbieren, bis die schuldige ID gefunden ist
+    const lookup = async (group: string[]): Promise<void> => {
+      if (Date.now() > until) {
+        complete = false;
+        return;
+      }
+      if (group.length === 1) ctx.lookups.single++;
+      else ctx.lookups.batches++;
+      let found: Map<string, TrackMeta>;
+      try {
+        found = await fetchTrackBatch(ctx, group);
+      } catch (err) {
+        if (!isPermanent(err)) {
+          noteError(err);
           return;
         }
-        ctx.lookups.single++;
-        try {
-          const meta = (await fetchTrackBatch(ctx, [id])).get(id);
-          if (meta) fetched.set(id, meta);
-          else confirmedMissing.add(id);
-        } catch (err) {
-          if (isPermanent(err)) confirmedMissing.add(id);
-          else noteError(err);
+        if (group.length === 1) {
+          confirmedMissing.add(group[0]);
+          return;
         }
+        const half = Math.ceil(group.length / 2);
+        await lookup(group.slice(0, half));
+        await lookup(group.slice(half));
+        return;
+      }
+      found.forEach((meta, key) => fetched.set(key, meta));
+      if (found.size >= 2) multiIdOk = true;
+      const rest = group.filter((id) => !found.has(id));
+      if (rest.length === 0) return;
+      if (group.length === 1) {
+        confirmedMissing.add(group[0]);
+        return;
+      }
+      if (multiIdOk && found.size <= 1) {
+        // auffällig wenig geliefert: Stichprobe einzeln prüfen, ob Tidal wirklich mehrere IDs beachtet
+        const probe = rest.slice(0, 2);
+        for (const id of probe) await lookup([id]);
+        if (probe.some((id) => fetched.has(id))) multiIdOk = false;
+        const remaining = rest.slice(2);
+        if (multiIdOk) remaining.forEach((id) => confirmedMissing.add(id));
+        else
+          await mapLimit(remaining, 2, async (id) => {
+            await lookup([id]);
+          });
+        return;
+      }
+      if (multiIdOk) {
+        // Tidal liefert nicht verfügbare Tracks einfach nicht mit
+        rest.forEach((id) => confirmedMissing.add(id));
+        return;
+      }
+      // noch unklar, ob Tidal mehrere IDs beachtet: Rest einzeln nachfragen
+      await mapLimit(rest, 2, async (id) => {
+        await lookup([id]);
       });
-    }
+    };
+    await lookup(batch);
+
     const pipe = kv().pipeline();
     let writes = 0;
     for (const id of batch) {
@@ -918,7 +947,7 @@ export function registerMaximTools(server: McpServer) {
       excludeTrackIds: z.array(z.string()).max(500).optional().describe('Track IDs to leave out, incl. other versions of the same songs'),
       limit: z.number().int().min(1).max(150).optional().describe('Max number of candidates returned (default 40)'),
       maxPerArtist: z.number().int().min(0).max(20).optional().describe('Max songs per artist in the returned list, 0 = no limit (default 2)'),
-      pagesPerSeed: z.number().int().min(1).max(5).optional().describe('Pages of similar tracks per seed, about 20 each (default 2)'),
+      pagesPerSeed: z.number().int().min(1).max(5).optional().describe('Pages of similar tracks per seed, about 20 each (default 1)'),
       windowDays: z.number().int().min(0).max(3650).optional().describe('History window in days (default 365)'),
       includeFavorites: z.boolean().optional().describe('Treat favorited tracks as owned (default true)'),
       force: z.boolean().optional().describe('Return candidates even if the library index is still incomplete'),
@@ -929,7 +958,7 @@ export function registerMaximTools(server: McpServer) {
       const ctx = await getContext(extractToken(extra), started);
       const max = limit ?? 40;
       const perArtist = maxPerArtist ?? 2;
-      const pages = pagesPerSeed ?? 2;
+      const pages = pagesPerSeed ?? 1;
       const windowMs = (windowDays ?? HISTORY_DAYS) * DAY_MS;
 
       const index = await buildLibraryIndex(ctx, started + 25000, includeFavorites ?? true);
