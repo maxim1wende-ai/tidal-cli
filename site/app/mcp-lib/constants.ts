@@ -1,5 +1,5 @@
 // Shared constants from the CLI auth module
-export const TIDAL_CLIENT_ID = 'PYVtmSHMTGI9oBUs';
+export const TIDAL_CLIENT_ID = process.env.TIDAL_CLIENT_ID ?? '';
 
 export const TIDAL_SCOPES = [
   'collection.read',
