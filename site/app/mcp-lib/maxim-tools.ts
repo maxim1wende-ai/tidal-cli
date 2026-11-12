@@ -16,7 +16,6 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createAPIClient } from '@tidal-music/api';
 import { Redis } from '@upstash/redis';
 
-import { listPlaylistsData } from '../../lib/cli/playlist';
 import { getTidalTokens, getAccessTokenUserId, saveTidalTokens } from './redis';
 import { refreshTidalToken } from './tidal-oauth';
 
@@ -149,6 +148,9 @@ interface Ctx {
   countryCode: string;
   userId: string;
   deadline: number; // harte Zeitgrenze für diesen Tool-Aufruf
+  requests: number;
+  rateLimited: number;
+  lookups: { batches: number; single: number; missing: number; errors: number; samples: string[] };
 }
 
 async function getContext(bearerToken: string, started: number): Promise<Ctx> {
@@ -184,40 +186,90 @@ async function getContext(bearerToken: string, started: number): Promise<Ctx> {
   };
 
   const client: any = createAPIClient(credentialsProvider as any);
-  return { client, countryCode: current.countryCode || 'US', userId, deadline: started + CALL_BUDGET_MS };
+  return { client, countryCode: current.countryCode || 'US', userId, deadline: started + CALL_BUDGET_MS, requests: 0, rateLimited: 0, lookups: { batches: 0, single: 0, missing: 0, errors: 0, samples: [] } };
+}
+
+// Drosselung: höchstens eine Anfrage je `spacing` ms; nach einem 429 pausieren alle Anfragen
+// gemeinsam (auch parallele) und der Abstand wird größer, bei Erfolg langsam wieder kleiner.
+const SPACING_MIN_MS = 120;
+const SPACING_MAX_MS = 1500;
+let spacing = SPACING_MIN_MS;
+let nextSlot = 0;
+let pauseUntil = 0;
+
+async function gate(ctx: Ctx): Promise<void> {
+  for (;;) {
+    const now = Date.now();
+    const wait = Math.max(pauseUntil - now, nextSlot - now);
+    if (wait <= 0) break;
+    if (now + wait > ctx.deadline - 1500) throw new Error('Zeitbudget des Aufrufs erschöpft (Tidal-Rate-Limit)');
+    await sleep(Math.min(wait, 2000));
+  }
+  nextSlot = Math.max(Date.now(), nextSlot) + spacing;
+  ctx.requests++;
+}
+
+function retryAfterMs(res: any, attempt: number): number {
+  const header = Number(res?.response?.headers?.get?.('retry-after'));
+  const ms = Number.isFinite(header) && header > 0 ? header * 1000 : 2000 * attempt;
+  return Math.min(Math.max(ms, 1000), 15000);
+}
+
+class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// 400/404/410/422: Anfrage selbst ungültig (z. B. Track gibt es nicht mehr) – Wiederholen bringt nichts.
+// 401/403 (Anmeldung) zählen bewusst nicht dazu, sonst würden bei einem Token-Problem alle Tracks als "fehlt" gemerkt.
+function isPermanent(err: unknown): boolean {
+  return err instanceof ApiError && [400, 404, 410, 422].includes(err.status);
 }
 
 // GET/POST mit Wiederholung bei 429 (Rate-Limit) und vorübergehenden Fehlern
 async function apiCall(ctx: Ctx, method: 'GET' | 'POST', path: string, params: Record<string, unknown>, body?: unknown): Promise<any> {
-  const attempts = method === 'GET' ? 4 : 3;
+  const attempts = method === 'GET' ? 5 : 4;
   let lastError: unknown = 'kein Versuch';
+  let lastStatus = 0;
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    await gate(ctx);
     const remaining = ctx.deadline - Date.now();
     if (remaining < 2000) {
       lastError = 'Zeitbudget des Aufrufs erschöpft';
       break;
     }
     let status = 0;
+    let res: any = null;
     try {
       const init: Record<string, unknown> = { params, signal: AbortSignal.timeout(Math.min(15000, remaining - 1000)) };
       if (body !== undefined) init.body = body;
-      const res: any = method === 'GET' ? await ctx.client.GET(path, init) : await ctx.client.POST(path, init);
+      res = method === 'GET' ? await ctx.client.GET(path, init) : await ctx.client.POST(path, init);
       status = Number(res?.response?.status ?? 0);
-      if (!res?.error && (method === 'POST' || res?.data)) return res?.data ?? null;
+      lastStatus = status;
+      if (!res?.error && status !== 429 && (method === 'POST' || res?.data)) {
+        spacing = Math.max(SPACING_MIN_MS, Math.floor(spacing * 0.97));
+        return res?.data ?? null;
+      }
       lastError = res?.error ?? `HTTP ${status}`;
     } catch (err) {
       lastError = errMsg(err);
       if (method === 'POST') break; // Ausgang unklar → nicht blind wiederholen (sonst evtl. doppelt)
     }
     if (status === 429) {
-      await sleep(1500 * attempt);
+      ctx.rateLimited++;
+      spacing = Math.min(SPACING_MAX_MS, spacing * 2);
+      pauseUntil = Math.max(pauseUntil, Date.now() + retryAfterMs(res, attempt));
+      lastError = 'HTTP 429 (Rate-Limit)';
       continue;
     }
     if (method === 'POST') break;
     if (status >= 400 && status < 500 && status !== 408) break;
     if (attempt < attempts) await sleep(400 * attempt);
   }
-  throw new Error(`Tidal ${method} ${path} fehlgeschlagen: ${errMsg(lastError)}`);
+  throw new ApiError(`Tidal ${method} ${path} fehlgeschlagen (HTTP ${lastStatus || '-'}): ${errMsg(lastError)}`, lastStatus);
 }
 
 interface Page {
@@ -362,15 +414,23 @@ async function getTrackDetails(ctx: Ctx, ids: string[], until: number): Promise<
     }
     let fetched = new Map<string, TrackMeta>();
     const confirmedMissing = new Set<string>();
-    let batchFailed = false;
+    let batchError: unknown = null;
+    const noteError = (err: unknown) => {
+      errors++;
+      ctx.lookups.errors++;
+      if (ctx.lookups.samples.length < 3) ctx.lookups.samples.push(errMsg(err).slice(0, 160));
+    };
+    ctx.lookups.batches++;
     try {
       fetched = await fetchTrackBatch(ctx, batch);
-    } catch {
-      batchFailed = true;
+    } catch (err) {
+      batchError = err;
     }
     if (batch.length === 1) {
-      if (batchFailed) errors++;
-      else if (!fetched.has(batch[0])) confirmedMissing.add(batch[0]);
+      if (batchError === null) {
+        if (!fetched.has(batch[0])) confirmedMissing.add(batch[0]);
+      } else if (isPermanent(batchError)) confirmedMissing.add(batch[0]);
+      else noteError(batchError);
     } else {
       // Was die Sammelabfrage nicht geliefert hat, einzeln nachfragen
       // (nicht verfügbar im Land – oder die API beachtet nur eine ID pro Anfrage)
@@ -380,12 +440,14 @@ async function getTrackDetails(ctx: Ctx, ids: string[], until: number): Promise<
           complete = false;
           return;
         }
+        ctx.lookups.single++;
         try {
           const meta = (await fetchTrackBatch(ctx, [id])).get(id);
           if (meta) fetched.set(id, meta);
           else confirmedMissing.add(id);
-        } catch {
-          errors++;
+        } catch (err) {
+          if (isPermanent(err)) confirmedMissing.add(id);
+          else noteError(err);
         }
       });
     }
@@ -400,6 +462,7 @@ async function getTrackDetails(ctx: Ctx, ids: string[], until: number): Promise<
       } else {
         missing.add(id);
         if (confirmedMissing.has(id)) {
+          ctx.lookups.missing++;
           // in diesem Land nicht verfügbar → eine Weile merken
           pipe.set(`mx:t:${id}`, { x: 1 }, { ex: TRACK_MISSING_TTL_S });
           writes++;
@@ -536,6 +599,8 @@ interface LibraryIndex {
   favoritesError?: string;
   pending: string[];
   failed: string[];
+  progress: string[]; // Stand der noch offenen Playlists (Diagnose)
+  errors: string[]; // Fehlermeldungen der fehlgeschlagenen Playlists (Diagnose)
   complete: boolean;
 }
 
@@ -622,15 +687,44 @@ async function advanceList(ctx: Ctx, src: ListSource, entry: ListEntry, until: n
   return { s: src.stamp, ids, isrcs: Array.from(isrcs), keys: Array.from(keys) };
 }
 
-async function listOwnPlaylists(ctx: Ctx) {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await listPlaylistsData(ctx.client, ctx.countryCode);
-    } catch (err) {
-      if (attempt >= 3 || Date.now() > ctx.deadline - 15000) throw err;
-      await sleep(1500 * attempt);
+interface OwnPlaylist {
+  id: string;
+  name: string;
+  numberOfItems?: number;
+  lastModifiedAt?: string;
+}
+
+// eigene Playlists (alle Seiten), mit Rate-Limit-Behandlung über apiCall
+async function listOwnPlaylists(ctx: Ctx): Promise<OwnPlaylist[]> {
+  const out: OwnPlaylist[] = [];
+  const seen = new Set<string>();
+  let cursor: string | null = null;
+  for (let n = 0; n < 50; n++) {
+    const query: Record<string, unknown> = { 'filter[owners.id]': ['me'], countryCode: ctx.countryCode };
+    if (cursor) query['page[cursor]'] = cursor;
+    let body: any = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      body = await apiCall(ctx, 'GET', '/playlists', { query });
+      if (Array.isArray(body?.data) && body.data.length > 0) break;
+      if (attempt < 3) await sleep(300);
     }
+    const data: any[] = Array.isArray(body?.data) ? body.data : [];
+    for (const p of data) {
+      if (p?.id == null) continue;
+      out.push({
+        id: String(p.id),
+        name: typeof p.attributes?.name === 'string' ? p.attributes.name : 'Untitled',
+        numberOfItems: typeof p.attributes?.numberOfItems === 'number' ? p.attributes.numberOfItems : undefined,
+        lastModifiedAt: typeof p.attributes?.lastModifiedAt === 'string' ? p.attributes.lastModifiedAt : undefined,
+      });
+    }
+    const next = nextCursorOf(body);
+    if (!next || seen.has(next) || data.length === 0) break;
+    seen.add(next);
+    cursor = next;
   }
+  if (out.length === 0) throw new Error('Tidal hat keine Playlists geliefert – bitte erneut versuchen');
+  return out;
 }
 
 async function buildLibraryIndex(ctx: Ctx, until: number, includeFavorites: boolean): Promise<LibraryIndex> {
@@ -664,7 +758,10 @@ async function buildLibraryIndex(ctx: Ctx, until: number, includeFavorites: bool
     5,
   );
   const state = sources.map((src, i) => ({ src, entry: readEntry(stored[i]), error: '' }));
-  const todo = state.filter((st) => !(st.entry.s === st.src.stamp && !st.entry.w));
+  // Favoriten zuerst, damit sie nicht hinter großen Playlists warten
+  const todo = state
+    .filter((st) => !(st.entry.s === st.src.stamp && !st.entry.w))
+    .sort((a, b) => Number(b.src.favorites) - Number(a.src.favorites));
 
   await mapLimit(todo, 3, async (st) => {
     if (Date.now() > until) return;
@@ -685,6 +782,8 @@ async function buildLibraryIndex(ctx: Ctx, until: number, includeFavorites: bool
     favorites: null,
     pending: [],
     failed: [],
+    progress: [],
+    errors: [],
     complete: true,
   };
   const addAll = (target: Map<string, string>, values: string[] | undefined, label: string) => {
@@ -707,8 +806,14 @@ async function buildLibraryIndex(ctx: Ctx, until: number, includeFavorites: bool
     }
     const current = entry.s === src.stamp && !entry.w;
     if (!current) {
-      if (error) index.failed.push(src.name);
-      else index.pending.push(src.name);
+      if (error) {
+        index.failed.push(src.name);
+        index.errors.push(`${src.name}: ${error.slice(0, 160)}`);
+      } else {
+        index.pending.push(src.name);
+        const w = entry.w && entry.w.s === src.stamp ? entry.w : null;
+        index.progress.push(`${src.name}: ${w ? (w.done ? `Details für ${w.ids.length} Songs` : `${w.ids.length} Songs gelesen`) : 'noch nicht begonnen'}`);
+      }
     }
   }
   index.complete = index.pending.length === 0;
@@ -740,6 +845,8 @@ function librarySummary(index: LibraryIndex) {
     pending: index.pending,
     failed: index.failed,
     favoritesError: index.favoritesError,
+    progress: index.progress.length > 0 ? index.progress.slice(0, 12) : undefined,
+    errors: index.errors.length > 0 ? index.errors.slice(0, 6) : undefined,
   };
 }
 
@@ -830,6 +937,7 @@ export function registerMaximTools(server: McpServer) {
         return text({
           libraryComplete: false,
           library: librarySummary(index),
+          api: { requests: ctx.requests, rateLimited: ctx.rateLimited, lookups: ctx.lookups },
           message:
             'Die Bibliothek wird noch eingelesen (beim ersten Mal und nach Änderungen an Playlists). Bitte dieses Tool gleich noch einmal mit denselben Angaben aufrufen.',
         });
@@ -995,6 +1103,7 @@ export function registerMaximTools(server: McpServer) {
       return text({
         libraryComplete: index.complete,
         library: librarySummary(index),
+        api: { requests: ctx.requests, rateLimited: ctx.rateLimited, lookups: ctx.lookups },
         seeds: { used: seeds.length, answered: hitsBySeed.size, errors: seedErrors },
         filtered: { raw: cands.size, ...stats, available: winners.length },
         note: out.length < 25 ? 'Wenige Kandidaten: erneut mit höherem seedCount (bis 30) und pagesPerSeed (bis 5) aufrufen.' : undefined,
@@ -1037,6 +1146,7 @@ export function registerMaximTools(server: McpServer) {
       return text({
         libraryComplete: index.complete,
         library: librarySummary(index),
+        api: { requests: ctx.requests, rateLimited: ctx.rateLimited, lookups: ctx.lookups },
         windowDays: windowDays ?? HISTORY_DAYS,
         ok,
         blocked,
