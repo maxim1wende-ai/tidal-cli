@@ -3,6 +3,7 @@
 //
 //   tidal_mix_candidates       Empfehlungen zu Seed-Songs sammeln, prüfen und ranken
 //   tidal_library_check        Track-IDs gegen alle eigenen Playlists, Favoriten und den Verlauf prüfen
+//   tidal_favorite_tracks      Favoriten ("Meine Titel") auflisten, optional nur noch nicht einsortierte
 //   tidal_playlist_add_tracks  mehrere Songs auf einmal hinzufügen und das Ergebnis nachprüfen
 //   tidal_playlist_tracks      Inhalt einer Playlist mit Titel, Interpreten und ISRC
 //   tidal_mix_history_record   Songs eines Tagesmixes im Verlauf vermerken (danach 365 Tage gesperrt)
@@ -1179,6 +1180,119 @@ export function registerMaximTools(server: McpServer) {
         windowDays: windowDays ?? HISTORY_DAYS,
         ok,
         blocked,
+      });
+    },
+  );
+
+  server.tool(
+    'tidal_favorite_tracks',
+    'List the favorited tracks ("Meine Titel") with title, artists and ISRC. With notInPlaylistIds only favorites are returned whose song (same track ID, same ISRC or same title + artist) is in none of these playlists – e.g. new favorites that are not yet sorted into the category playlists. Favorites are re-read from Tidal at most once a week unless refresh is true. Unavailable tracks are left out. If complete is false, simply call again with the same arguments.',
+    {
+      notInPlaylistIds: z.array(z.string()).max(100).optional().describe('Only return favorites whose song is in none of these playlists'),
+      refresh: z.boolean().optional().describe('Re-read the favorites from Tidal today instead of using the copy from the last 7 days (default false)'),
+      limit: z.number().int().min(1).max(500).optional().describe('Max number of tracks returned (default 200)'),
+      offset: z.number().int().min(0).optional().describe('Skip this many matching tracks, for paging (default 0)'),
+    },
+    { readOnlyHint: true, destructiveHint: false, openWorldHint: true, title: 'Favorite Tracks' },
+    async ({ notInPlaylistIds, refresh, limit, offset }, extra) => {
+      const started = Date.now();
+      const ctx = await getContext(extractToken(extra), started);
+      const api = () => ({ requests: ctx.requests, rateLimited: ctx.rateLimited, lookups: ctx.lookups });
+
+      // 1) Favoriten lesen – gleicher Zwischenspeicher wie im Bibliotheks-Index
+      const favSource: ListSource = {
+        cacheKey: `mx:fav:${ctx.userId}`,
+        path: FAVORITE_TRACKS,
+        id: 'me',
+        name: 'Favoriten',
+        stamp: refresh ? `d${isoDate(started)}` : `w${Math.floor(started / (FAVORITES_REFRESH_DAYS * DAY_MS))}`,
+        size: Number.MAX_SAFE_INTEGER,
+        favorites: true,
+      };
+      let favEntry = readEntry(await kv().get(favSource.cacheKey));
+      if (!(favEntry.s === favSource.stamp && !favEntry.w)) {
+        favEntry = fitEntry(await advanceList(ctx, favSource, favEntry, started + 25000));
+        await kv().set(favSource.cacheKey, favEntry, { ex: LIST_TTL_S });
+      }
+      if (favEntry.w || !favEntry.ids) {
+        return text({
+          complete: false,
+          note: 'Favoriten werden noch eingelesen – einfach mit denselben Angaben erneut aufrufen.',
+          read: favEntry.w ? favEntry.w.ids.length : 0,
+          api: api(),
+        });
+      }
+      const favIds = favEntry.ids;
+
+      // 2) Songs der angegebenen Playlists (gleiche ID, ISRC oder Titel + Interpret)
+      const wanted = dedupe(notInPlaylistIds ?? []);
+      const exclIds = new Set<string>();
+      const exclIsrcs = new Set<string>();
+      const exclKeys = new Set<string>();
+      const notFound: string[] = [];
+      if (wanted.length > 0) {
+        const index = await buildLibraryIndex(ctx, started + 40000, false);
+        if (!index.complete) {
+          return text({
+            complete: false,
+            note: 'Playlists werden noch eingelesen – einfach mit denselben Angaben erneut aufrufen.',
+            library: librarySummary(index),
+            api: api(),
+          });
+        }
+        const raw = await mgetChunked<unknown>(
+          wanted.map((id) => `mx:pl:${ctx.userId}:${id}`),
+          50,
+        );
+        raw.forEach((value, i) => {
+          const e = readEntry(value);
+          if (!e.ids) {
+            notFound.push(wanted[i]);
+            return;
+          }
+          for (const v of e.ids) exclIds.add(v);
+          for (const v of e.isrcs ?? []) exclIsrcs.add(v);
+          for (const v of e.keys ?? []) exclKeys.add(v);
+        });
+      }
+
+      // 3) Details der Favoriten und Filter
+      const details = await getTrackDetails(ctx, favIds, started + 48000);
+      if (!details.complete) {
+        return text({
+          complete: false,
+          note: 'Details der Favoriten werden noch geladen – einfach mit denselben Angaben erneut aufrufen.',
+          api: api(),
+        });
+      }
+      const matched: Array<Record<string, unknown>> = [];
+      let unavailable = 0;
+      for (const id of favIds) {
+        const meta = details.map.get(id);
+        if (!meta) {
+          unavailable++;
+          continue;
+        }
+        if (exclIds.has(id)) continue;
+        if (meta.isrc && exclIsrcs.has(meta.isrc)) continue;
+        if (songKeys(meta).some((k) => exclKeys.has(k))) continue;
+        matched.push({ id, title: meta.title, artists: meta.artists, isrc: meta.isrc ?? null });
+      }
+
+      const from = offset ?? 0;
+      const page = matched.slice(from, from + (limit ?? 200));
+      return text({
+        complete: true,
+        favorites: favIds.length,
+        unavailable,
+        checkedPlaylists: wanted.length - notFound.length,
+        notFoundPlaylists: notFound,
+        matched: matched.length,
+        offset: from,
+        returned: page.length,
+        more: from + page.length < matched.length,
+        tracks: page,
+        api: api(),
       });
     },
   );
